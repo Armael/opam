@@ -545,7 +545,8 @@ let copy_file_aux f src dst =
   if file_or_symlink_exists dst
   then remove_file dst;
   mkdir (Filename.dirname dst);
-  command ~verbose:(verbose_for_base_commands ()) ("cp"::(cygify f [src; dst]))
+  command ~verbose:(verbose_for_base_commands ())
+    ("cp"::"--reflink=auto"::(cygify f [src; dst]))
 
 let copy_file = copy_file_aux (get_cygpath_function ~command:"cp")
 
@@ -556,13 +557,13 @@ let copy_dir src dst =
       | [] -> ()
       | srcfiles ->
         command ~verbose:(verbose_for_base_commands ())
-          ([ "cp"; "-PRp" ] @ srcfiles @ [ dst ])
+          ([ "cp"; "--reflink=auto"; "-PRp" ] @ srcfiles @ [ dst ])
     else internal_error "Can not copy dir %s to %s, which is not a directory"
         src dst
   else
     (mkdir (Filename.dirname dst);
      command ~verbose:(verbose_for_base_commands ())
-       [ "cp"; "-PRp"; src; dst ])
+       [ "cp"; "--reflink=auto"; "-PRp"; src; dst ])
 
 let mv_aux f src dst =
   if file_or_symlink_exists dst then remove_file dst;
