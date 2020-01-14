@@ -103,8 +103,37 @@ let process_dot_install st nv build_dir =
                     OpamFilename.create dst_dir (OpamFilename.Base.add_extension d "exe")
                   else
                     OpamFilename.create dst_dir d in
-            if check ~src:build_dir ~dst:dst_dir base then
-              OpamFilename.install ~warning ~exec ~src:src_file ~dst:dst_file ();
+            if check ~src:build_dir ~dst:dst_dir base then begin
+              let file_or_symlink_exists f =
+                try ignore (Unix.lstat f); true
+                with Unix.Unix_error (Unix.ENOENT, _, _) -> false
+              in
+              let install_by_mv ?exec ~src ~dst () =
+                let install ?exec src dst =
+                  if Sys.is_directory src then
+                    OpamSystem.internal_error "Cannot install %s: it is a directory." src;
+                  if (try Sys.is_directory dst with Sys_error _ -> false) then
+                    OpamSystem.internal_error "Cannot install to %s: it is a directory." dst;
+                  OpamSystem.mkdir (Filename.dirname dst);
+                  let exec = match exec with
+                    | Some e -> e
+                    | None -> OpamSystem.is_exec src in
+                  if file_or_symlink_exists dst then OpamSystem.remove_file dst;
+                  OpamSystem.mkdir (Filename.dirname dst);
+                  Unix.rename src dst;
+                  Unix.chmod dst (if exec then 0o755 else 0o644);
+                in
+                if src <> dst then (
+                  let src =
+                    if OpamFilename.is_symlink src then
+                      OpamFilename.readlink src
+                    else src
+                  in
+                  install ?exec (OpamFilename.to_string src) (OpamFilename.to_string dst)
+                )
+              in
+              install_by_mv ~exec ~src:src_file ~dst:dst_file ();
+            end
           ) files in
 
       let module P = OpamPath.Switch in
