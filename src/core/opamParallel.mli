@@ -24,6 +24,7 @@ module type G = sig
   module Topological: sig
     val fold: (V.t -> 'a -> 'a) -> t -> 'a -> 'a
   end
+  val iter: ?pre:(V.t -> unit) -> ?post:(V.t -> unit) -> t -> unit
   val has_cycle: t -> bool
   val scc_list: t -> V.t list list
 end
