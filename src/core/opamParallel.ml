@@ -184,6 +184,7 @@ module Make (G : G) = struct
             M.add n (p, cont, OpamProcess.text_of_command cmd) running
           in
           print_status (M.cardinal results) running;
+          log "%a: yielding" (slog (string_of_int @* V.hash)) n;
           loop nslots results running ready
       in
 
@@ -284,6 +285,7 @@ module Make (G : G) = struct
         run_seq_command nslots ready n cmd
       else
       (* Wait for a process to end *)
+      let () = log "waiting for a process to end" in
       let process, result =
         if dry_run then
           OpamProcess.dry_wait_one (List.map fst processes)
