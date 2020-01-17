@@ -225,6 +225,26 @@ module Make (G : G) = struct
         raise (Errors (M.keys results, List.rev errors, List.rev remaining))
       in
 
+      let processes =
+        M.fold (fun n (p,x,_) acc -> (p,(n,x)) :: acc) running [] in
+
+      match OpamStd.List.find_map (fun (p,x) ->
+          match OpamProcess.dontwait p with
+          | None -> None
+          | Some res -> Some (p, res, x)
+        ) processes
+      with
+      | (_,result,(n,cont)) ->
+        log "Collected task for job %a (ret:%d) (greedy)"
+          (slog (string_of_int @* V.hash)) n result.OpamProcess.r_code;
+        let next =
+          try cont result with e ->
+            OpamProcess.cleanup result;
+            fail n e in
+        OpamProcess.cleanup result;
+        run_seq_command nslots ready n next
+
+      | exception Not_found ->
       if M.is_empty running && S.is_empty ready then
         results
       else if
@@ -264,9 +284,6 @@ module Make (G : G) = struct
         run_seq_command nslots ready n cmd
       else
       (* Wait for a process to end *)
-      let processes =
-        M.fold (fun n (p,x,_) acc -> (p,(n,x)) :: acc) running []
-      in
       let process, result =
         if dry_run then
           OpamProcess.dry_wait_one (List.map fst processes)
