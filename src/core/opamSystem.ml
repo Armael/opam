@@ -447,8 +447,13 @@ let t_resolve_command =
       | _ -> `Not_found
     else `Not_found
   in
+  let resolve_cache = Hashtbl.create 100 in
   fun ?(env=default_env) ?dir name ->
-    resolve env ?dir name
+    try Hashtbl.find resolve_cache (env, dir, name)
+    with Not_found ->
+      let res = resolve env ?dir name in
+      Hashtbl.replace resolve_cache (env, dir, name) res;
+      res
 
 let resolve_command ?env ?dir name =
   match t_resolve_command ?env ?dir name with
