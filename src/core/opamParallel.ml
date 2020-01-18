@@ -67,6 +67,7 @@ module Make (G : G) = struct
   module M = OpamStd.Map.Make (V)
   module S = OpamStd.Set.Make (V)
 
+  (*
   (* naive implementation of priority queues as sets *)
   module PQueue : sig
     type t
@@ -99,7 +100,7 @@ module Make (G : G) = struct
       match take_opt s with
       | Some x -> x
       | None -> failwith "PQueue.take"
-  end
+  end *)
 
   exception Errors of G.V.t list * (G.V.t * exn) list * G.V.t list
   exception Cyclic of V.t list list
@@ -143,19 +144,6 @@ module Make (G : G) = struct
       raise (Cyclic sccs)
     );
 
-    let nb_revdeps_of_vertex =
-      let r = ref M.empty in
-      let nb v = try M.find v !r with Not_found -> 0 in
-      let upd v n = r := M.add v n !r in
-      G.iter
-        ~post:(fun v ->
-            let transitive_revdeps =
-              List.fold_left (fun sum w -> sum + nb w) 0 (G.succ g v) in
-            upd v (transitive_revdeps + G.out_degree g v))
-        g;
-      !r
-    in
-
     let print_status
         (finished: int)
         (running: (int * OpamProcess.t * _ * string option) M.t) =
@@ -194,7 +182,7 @@ module Make (G : G) = struct
                    (OpamProcess.result -> 'b OpamProcess.job) *
                    string option
                   ) M.t)
-        (ready: PQueue.t array)
+        (ready: S.t array)
         (free_slots: int array)
       =
       let run_seq_command n pool_id (job: 'b OpamProcess.job): 'b M.t =
@@ -214,8 +202,7 @@ module Make (G : G) = struct
               then begin
                 let m_pools = try M.find m pools_of_task with Not_found -> failwith "b" in
                 List.iter (fun pool ->
-                    let priority = try M.find m nb_revdeps_of_vertex with Not_found -> failwith "c" in
-                    ready.(pool) <- PQueue.add m ~priority ready.(pool)
+                    ready.(pool) <- S.add m ready.(pool)
                   ) m_pools
               end
             ) (G.succ g n);
@@ -272,21 +259,21 @@ module Make (G : G) = struct
         raise (Errors (M.keys results, List.rev errors, List.rev remaining))
       in
 
-      if M.is_empty running && Array.for_all PQueue.is_empty ready then
+      if M.is_empty running && Array.for_all S.is_empty ready then
         results
       else
       let rec find_ready_pool i =
         if i >= Array.length ready then None
         else if free_slots.(i) > 0 &&
-                not (PQueue.is_empty ready.(i))
+                not (S.is_empty ready.(i))
         then Some i
         else find_ready_pool (i+1)
       in
       match find_ready_pool 0 with
       | Some pool ->
         (* Start a new process *)
-        let pq, n = PQueue.take ready.(pool) in
-        ready.(pool) <- pq;
+        let n = S.choose ready.(pool) in
+        ready.(pool) <- S.remove n ready.(pool);
         if not (M.mem n running) && not (M.mem n results) then begin
           log "Starting job %a (worker %a): %a"
             (slog (string_of_int @* V.hash)) n
@@ -344,14 +331,13 @@ module Make (G : G) = struct
     in
 
     let npools = List.length pools in
-    let ready = Array.make npools PQueue.empty in
+    let ready = Array.make npools S.empty in
     let free_slots = Array.of_list (List.map snd pools) in
 
     S.iter (fun m ->
         let m_pools = M.find m pools_of_task in
         List.iter (fun pool ->
-            let priority = M.find m nb_revdeps_of_vertex in
-            ready.(pool) <- PQueue.add m ~priority ready.(pool)
+            ready.(pool) <- S.add m ready.(pool)
           ) m_pools
       ) roots;
 
