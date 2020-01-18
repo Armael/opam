@@ -44,6 +44,8 @@ module type MAP = sig
   val of_list: (key * 'a) list -> 'a t
   val safe_add: key -> 'a -> 'a t -> 'a t
   val update: key -> ('a -> 'a) -> 'a -> 'a t -> 'a t
+  val partition_map: (key -> 'a -> [`Left of 'b | `Right of 'c | `Drop]) ->
+    'a t -> 'b t * 'c t
 end
 module type ABSTRACT = sig
   type t
@@ -344,6 +346,13 @@ module Map = struct
       let v = try find k map with Not_found -> zero in
       add k (f v) map
 
+    let partition_map f map =
+      fold (fun k v (mapl, mapr) ->
+          match f k v with
+          | `Left x -> (add k x mapl, mapr)
+          | `Right y -> (mapl, add k y mapr)
+          | `Drop -> (mapl, mapr)
+        ) map (empty, empty)
   end
 
 end

@@ -78,6 +78,9 @@ module type MAP = sig
   (** [update k f zero map] updates the binding of [k] in [map] using function
       [f], applied to the current value bound to [k] or [zero] if none *)
   val update: key -> ('a -> 'a) -> 'a -> 'a t -> 'a t
+
+  val partition_map: (key -> 'a -> [`Left of 'b | `Right of 'c | `Drop]) ->
+    'a t -> 'b t * 'c t
 end
 
 (** A signature for handling abstract keys and collections thereof *)

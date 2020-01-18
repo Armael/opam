@@ -154,7 +154,7 @@ module Job: sig
     (** Stage a shell command with its continuation, eg:
         {[
           command "ls" ["-a"] @@> fun result ->
-          if OpamProcess.is_success result then Done result.r_stdout
+         if OpamProcess.is_success result then Done result.r_stdout
           else failwith "ls"
         ]}
     *)

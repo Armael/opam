@@ -127,7 +127,6 @@ module Make (G : G) = struct
       in
       default :: defined
     in
-
     (* mapping task -> pool ids *)
     let _, pools_of_task = List.fold_left (fun (i, pools_of_task) (pool, _) ->
         i + 1,
@@ -175,62 +174,16 @@ module Make (G : G) = struct
       if texts <> [] then OpamConsole.status_line "%s" (String.concat " " texts)
     in
 
-    let rec loop
-        (results: 'b M.t)
-        (running: (int *
-                   OpamProcess.t *
-                   (OpamProcess.result -> 'b OpamProcess.job) *
-                   string option
-                  ) M.t)
-        (ready: S.t array)
-        (free_slots: int array)
-      =
-      let run_seq_command n pool_id (job: 'b OpamProcess.job): 'b M.t =
-        match job with
-        | Done r ->
-          log "Job %a finished" (slog (string_of_int @* V.hash)) n;
-          let results = M.add n r results in
-          let running =
-            if M.mem n running then M.remove n running else running in
-          if not (M.is_empty running) then
-            print_status (M.cardinal results) running;
-          free_slots.(pool_id) <- free_slots.(pool_id) + 1;
-          List.iter (fun m ->
-              if not (M.mem m running) &&
-                 not (M.mem m results) &&
-                 List.for_all (fun n -> M.mem n results) (G.pred g m)
-              then begin
-                let m_pools = try M.find m pools_of_task with Not_found -> failwith "b" in
-                List.iter (fun pool ->
-                    ready.(pool) <- S.add m ready.(pool)
-                  ) m_pools
-              end
-            ) (G.succ g n);
-          loop results running ready free_slots
-        | Run (cmd, cont) ->
-          log "Next task in job %a: %a" (slog (string_of_int @* V.hash)) n
-            (slog OpamProcess.string_of_command) cmd;
-          let p =
-            if dry_run then OpamProcess.dry_run_background cmd
-            else OpamProcess.run_background cmd
-          in
-          let running =
-            M.add n (pool_id, p, cont, OpamProcess.text_of_command cmd) running
-          in
-          print_status (M.cardinal results) running;
-          loop results running ready free_slots
-      in
-
-      let fail node error =
-        log "Exception while computing job %a: %a"
-          (slog (string_of_int @* V.hash)) node
-          (slog V.to_string) node;
-        if error = Sys.Break then OpamConsole.error "User interruption";
-        let running = M.remove node running in
-        (* Cleanup *)
-        let errors,pend =
-          if dry_run then [node,error],[] else
-            M.fold (fun n (_,p,cont,_text) (errors,pend) ->
+    let fail node error results running =
+      log "Exception while computing job %a: %a"
+        (slog (string_of_int @* V.hash)) node
+        (slog V.to_string) node;
+      if error = Sys.Break then OpamConsole.error "User interruption";
+      let running = M.remove node running in
+      (* Cleanup *)
+      let errors,pend =
+        if dry_run then [node,error],[] else
+          M.fold (fun n (_,p,cont,_text) (errors,pend) ->
               try
                 match OpamProcess.dontwait p with
                 | None -> (* process still running *)
@@ -247,61 +200,132 @@ module Make (G : G) = struct
               | Unix.Unix_error _ -> errors, pend
               | e -> (n,e)::errors, pend)
             running ([node,error],[])
-        in
-        (try List.iter (fun _ -> ignore (OpamProcess.wait_one pend)) pend
-         with e -> log "%a in sub-process cleanup" (slog Printexc.to_string) e);
-        (* Generate the remaining nodes in topological order *)
-        let remaining =
-          G.Topological.fold (fun n remaining ->
-              if M.mem n results || List.mem_assoc n errors then remaining
-              else n::remaining)
-            g [] in
-        raise (Errors (M.keys results, List.rev errors, List.rev remaining))
+      in
+      (try List.iter (fun _ -> ignore (OpamProcess.wait_one pend)) pend
+       with e -> log "%a in sub-process cleanup" (slog Printexc.to_string) e);
+      (* Generate the remaining nodes in topological order *)
+      let remaining =
+        G.Topological.fold (fun n remaining ->
+            if M.mem n results || List.mem_assoc n errors then remaining
+            else n::remaining)
+          g [] in
+      raise (Errors (M.keys results, List.rev errors, List.rev remaining))
+    in
+
+    let rec loop
+        (results: 'b M.t)
+        (running: (int *
+                   OpamProcess.t *
+                   (OpamProcess.result -> 'b OpamProcess.job) *
+                   string option
+                  ) M.t)
+        (ready: S.t array)
+        (free_slots: int array)
+      =
+
+      let register_job n pool_id (job: 'b OpamProcess.job) results running =
+        match job with
+        | Done r ->
+          log "Job %a finished" (slog (string_of_int @* V.hash)) n;
+          let results = M.add n r results in
+          let running =
+            if M.mem n running then M.remove n running else running in
+          if not (M.is_empty running) then
+            print_status (M.cardinal results) running;
+          free_slots.(pool_id) <- free_slots.(pool_id) + 1;
+          List.iter (fun m ->
+              if not (M.mem m running) &&
+                 not (M.mem m results) &&
+                 List.for_all (fun n -> M.mem n results) (G.pred g m)
+              then begin
+                let m_pools = M.find m pools_of_task in
+                List.iter (fun pool ->
+                    ready.(pool) <- S.add m ready.(pool)
+                  ) m_pools
+              end
+            ) (G.succ g n);
+          (results, running)
+        | Run (cmd, cont) ->
+          log "Next task in job %a: %a" (slog (string_of_int @* V.hash)) n
+            (slog OpamProcess.string_of_command) cmd;
+          let p =
+            if dry_run then OpamProcess.dry_run_background cmd
+            else OpamProcess.run_background cmd
+          in
+          let running =
+            (* nb: this replaces the process previously registered for node [n]
+               (if any) *)
+            M.add n (pool_id, p, cont, OpamProcess.text_of_command cmd) running
+          in
+          print_status (M.cardinal results) running;
+          (results, running)
+      in
+
+      (* collect and process all the processes that finished *)
+      let process_done, running =
+        M.partition_map (fun _ (pool_id,p,cont,cmd) ->
+          match OpamProcess.dontwait p with
+          | Some res -> `Left (pool_id, cont, res)
+          | None -> `Right (pool_id, p, cont, cmd)
+        ) running
+      in
+      let results, running =
+        M.fold (fun n (pool_id, cont, result) (results, running) ->
+          log "Collected task for job %a (ret:%d)"
+            (slog (string_of_int @* V.hash)) n result.OpamProcess.r_code;
+          let next : 'b OpamProcess.job =
+            try cont result with e ->
+              OpamProcess.cleanup result;
+              fail n e results running in
+          OpamProcess.cleanup result;
+          register_job n pool_id next results running
+        ) process_done (results, running)
+      in
+
+      (* schedule ready tasks on available slots *)
+      let results, running =
+        let acc = ref (results, running) in
+        for i = 0 to Array.length ready - 1 do
+          while free_slots.(i) > 0 && not (S.is_empty ready.(i)) do
+            let results, running = !acc in
+            let n = S.choose ready.(i) in
+            ready.(i) <- S.remove n ready.(i);
+            if not (M.mem n running) && not (M.mem n results) then begin
+              log "Starting job %a (worker %a): %a"
+                (slog (string_of_int @* V.hash)) n
+                (* (slog
+                 *    (fun pools ->
+                 *       let slots = get_slots nslots n in
+                 *       OpamStd.List.concat_map " " (fun (pool, jobs) ->
+                 *           let nslots =
+                 *             OpamStd.Option.of_Not_found (List.assoc pool) slots
+                 *           in
+                 *           Printf.sprintf "%s/%d"
+                 *             (match nslots with
+                 *              | None -> "-"
+                 *              | Some n -> string_of_int (jobs - n + 1))
+                 *             jobs)
+                 *         pools))
+                 * pools *)
+                (slog (fun x -> x)) "??"
+                (slog V.to_string) n;
+              let pred =
+                List.map (fun n -> n, M.find n results) (G.pred g n) in
+              let cmd = try command ~pred n with e -> fail n e results running in
+              free_slots.(i) <- free_slots.(i) - 1;
+              acc := register_job n i cmd results running
+            end
+          done
+        done;
+        !acc
       in
 
       if M.is_empty running && Array.for_all S.is_empty ready then
         results
-      else
-      let rec find_ready_pool i =
-        if i >= Array.length ready then None
-        else if free_slots.(i) > 0 &&
-                not (S.is_empty ready.(i))
-        then Some i
-        else find_ready_pool (i+1)
-      in
-      match find_ready_pool 0 with
-      | Some pool ->
-        (* Start a new process *)
-        let n = S.choose ready.(pool) in
-        ready.(pool) <- S.remove n ready.(pool);
-        if not (M.mem n running) && not (M.mem n results) then begin
-          log "Starting job %a (worker %a): %a"
-            (slog (string_of_int @* V.hash)) n
-            (* (slog
-             *    (fun pools ->
-             *       let slots = get_slots nslots n in
-             *       OpamStd.List.concat_map " " (fun (pool, jobs) ->
-             *           let nslots =
-             *             OpamStd.Option.of_Not_found (List.assoc pool) slots
-             *           in
-             *           Printf.sprintf "%s/%d"
-             *             (match nslots with
-             *              | None -> "-"
-             *              | Some n -> string_of_int (jobs - n + 1))
-             *             jobs)
-             *         pools))
-             * pools *)
-            (slog (fun x -> x)) "??"
-            (slog V.to_string) n;
-          let pred = G.pred g n in
-          let pred = List.map (fun n -> n, try M.find n results with Not_found -> failwith "d") pred in
-          let cmd = try command ~pred n with e -> fail n e in
-          free_slots.(pool) <- free_slots.(pool) - 1;
-          run_seq_command n pool cmd
-        end else
-          loop results running ready free_slots
-      | None ->
+      else begin
+        assert (not (M.is_empty running));
         (* Wait for a process to end *)
+        log "waiting for a process to end";
         let processes =
           M.fold (fun n (id,p,x,_) acc -> (p,(n,(x,id))) :: acc) running []
         in
@@ -311,7 +335,7 @@ module Make (G : G) = struct
           else try match processes with
             | [p,_] -> p, OpamProcess.wait p
             | _ -> OpamProcess.wait_one (List.map fst processes)
-            with e -> fail (fst (snd (List.hd processes))) e
+            with e -> fail (fst (snd (List.hd processes))) e results running
         in
         let n, (cont, pool_id) = List.assoc process processes in
         log "Collected task for job %a (ret:%d)"
@@ -319,9 +343,12 @@ module Make (G : G) = struct
         let next : 'b OpamProcess.job =
           try cont result with e ->
             OpamProcess.cleanup result;
-            fail n e in
+            fail n e results running in
         OpamProcess.cleanup result;
-        run_seq_command n pool_id next
+        let results, running = register_job n pool_id next results running in
+        log "scheduler: new loop iteration";
+        loop results running ready free_slots
+      end
     in
 
     let roots =
@@ -330,8 +357,7 @@ module Make (G : G) = struct
         g S.empty
     in
 
-    let npools = List.length pools in
-    let ready = Array.make npools S.empty in
+    let ready = Array.make (List.length pools) S.empty in
     let free_slots = Array.of_list (List.map snd pools) in
 
     S.iter (fun m ->
