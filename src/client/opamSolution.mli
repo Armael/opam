@@ -36,6 +36,9 @@ val apply:
   ?assume_built:bool ->
   ?download_only:bool ->
   ?force_remove:bool ->
+  ?report_action_result:
+    (package action -> (OpamPackage.Set.t * OpamPackage.Set.t,
+                        OpamSolver.Action.Set.t) action_result -> unit) ->
   OpamSolver.solution ->
   rw switch_state * solution_result
 
