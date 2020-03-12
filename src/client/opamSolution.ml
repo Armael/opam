@@ -462,14 +462,14 @@ let parallel_apply t
 
   let timings = Hashtbl.create 17 in
   (* the child job to run on each action *)
-  let job ~pred action =
+  let job ~pred action : (_, _) action_result OpamProcess.job =
     let installed, removed, failed =
       List.fold_left (fun (inst,rem,fail) -> function
           | _, `Successful (inst1, rem1) ->
             OpamPackage.Set.Op.(inst ++ inst1, rem ++ rem1, fail)
-          | _, `Error (`Aborted a) ->
+          | _, `Aborted a ->
             inst, rem, PackageAction.Set.Op.(a ++ fail)
-          | a, (`Exception _ | `Error _) ->
+          | a, (`Exception _) ->
             inst, rem, PackageAction.Set.add a fail)
         (OpamPackage.Set.empty, OpamPackage.Set.empty, PackageAction.Set.empty)
         pred
@@ -486,7 +486,7 @@ let parallel_apply t
     if has_failure && (not action_is_remove || has_nonfetch_failure)
     then
       (* fatal error *)
-      Done (`Error (`Aborted failed))
+      Done (`Aborted failed)
     else
     let store_time =
       let t0 = Unix.gettimeofday () in
@@ -643,7 +643,7 @@ let parallel_apply t
              with [] | [_] -> None | l -> Some (l,1))
           same_inplace_source
       in
-      let results =
+      let results : (_ * (_, _) action_result) list =
         PackageActionGraph.Parallel.map
           ~jobs:(Lazy.force OpamStateConfig.(!r.jobs))
           ~command:job
@@ -675,7 +675,7 @@ let parallel_apply t
                 let r = match List.assoc a results with
                   | `Successful _ -> `String "OK"
                   | `Exception e -> Json.exc e
-                  | `Error (`Aborted deps) ->
+                  | `Aborted deps ->
                     let deps = OpamSolver.Action.Set.elements deps in
                     `O ["aborted", `A (List.map OpamSolver.Action.to_json deps)]
                 in
@@ -696,7 +696,7 @@ let parallel_apply t
         List.fold_left (fun (success, failure, aborted) -> function
             | a, `Successful _ -> a::success, failure, aborted
             | a, `Exception e -> success, (a,e)::failure, aborted
-            | a, `Error (`Aborted _) -> success, failure, a::aborted
+            | a, `Aborted _ -> success, failure, a::aborted
           ) ([], [], []) results
       in
       let actions_result = {
