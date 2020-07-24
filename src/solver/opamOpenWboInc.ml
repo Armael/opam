@@ -406,7 +406,12 @@ let def_criterion (ctx: Cnf.ctx)  (preamble, universe, request) (pid: indexed_pk
         let pkg_max_ver_lag =
           Hashtbl.find pkg_max_version_lag pkg.Cudf.package in
         (* renormalize *)
-        (v * overall_max_version_lag) / pkg_max_ver_lag
+        if pkg_max_ver_lag > 0 then
+          (v * overall_max_version_lag) / pkg_max_ver_lag
+        else (
+          assert (pkg_max_ver_lag = 0 && v = 0);
+          v
+        )
     end else (fun _pkg v -> v)
   in
   let prop_val pkg =
