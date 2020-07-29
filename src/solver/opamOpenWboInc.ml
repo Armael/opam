@@ -555,7 +555,8 @@ let def_criteria ctx cudf pid (criteria: criterion list): Cnf.weighted Cnf.t =
 let output_wcnf (cout: out_channel) (ctx: Cnf.ctx)
     (pkgs_cnf: Cnf.unweighted Cnf.t)
     (req_cnf: Cnf.unweighted Cnf.t)
-    (criteria_cnf: Cnf.weighted Cnf.t)
+    (criteria_cnf: Cnf.weighted Cnf.t):
+  int
   =
   let cnf =
     Cnf.andl [Cnf.to_weighted pkgs_cnf; Cnf.to_weighted req_cnf; criteria_cnf]
@@ -587,6 +588,7 @@ let output_wcnf (cout: out_channel) (ctx: Cnf.ctx)
   Cnf.fold (fun () -> output_clause) () (Cnf.to_weighted req_cnf);
   Printf.fprintf cout "c Optimization criteria\n";
   Cnf.fold (fun () -> output_clause) () criteria_cnf;
+  max_lit
 
 type solver_result =
   | Optimum_found of Cudf.package list
@@ -594,14 +596,14 @@ type solver_result =
   | Unsat
   | Unknown
 
-let parse_solver_output (pid: indexed_pkgs) (output: string list): solver_result =
+let parse_solver_output (pid: indexed_pkgs) (expected_nlits: int) (output: string list): solver_result =
   let s_line =
     try
       List.find (OpamStd.String.starts_with ~prefix:"s ") output
       |> OpamStd.String.remove_prefix ~prefix:"s "
       |> OpamStd.String.strip
     with Not_found ->
-      raise (Common.CudfSolver.Error "Ill-formed output: no solution status")
+      raise (Common.CudfSolver.Error "no solution status")
   in
   let get_solution () =
     let values =
@@ -611,8 +613,10 @@ let parse_solver_output (pid: indexed_pkgs) (output: string list): solver_result
         |> OpamStd.String.strip
         |> (fun s -> OpamStd.String.split s ' ')
       with Not_found ->
-        raise (Common.CudfSolver.Error "Ill-formed output: no solution values")
+        raise (Common.CudfSolver.Error "no solution values")
     in
+    if List.length values <> expected_nlits then
+      raise (Common.CudfSolver.Error "empty or incomplete solution");
     OpamStd.List.filter_map (fun s ->
         try
           let x = int_of_string s in
@@ -625,7 +629,7 @@ let parse_solver_output (pid: indexed_pkgs) (output: string list): solver_result
               None
         with Invalid_argument _ ->
           raise (Common.CudfSolver.Error
-                   ("Ill-formed output: invalid solution literal " ^ s))
+                   ("invalid solution literal " ^ s))
       ) values
   in
   match s_line with
@@ -635,7 +639,7 @@ let parse_solver_output (pid: indexed_pkgs) (output: string list): solver_result
   | "UNKNOWN" -> Unknown
   | _ ->
     raise (Common.CudfSolver.Error
-             ("Ill-formed output: unknown solution status " ^ s_line))
+             ("unknown solution status " ^ s_line))
 
 let call ~criteria ?(timeout = 60.) (preamble, universe, _ as cudf) =
   log "Indexing universe packages";
@@ -653,10 +657,11 @@ let call ~criteria ?(timeout = 60.) (preamble, universe, _ as cudf) =
   let solver_out =
     OpamFilename.of_string (OpamSystem.temp_file "solver-open-wbo-inc-out") in
   try
-    let () =
+    let cnf_nlits =
       let oc = OpamFilename.open_out solver_in in
-      output_wcnf oc ctx pkgs_cnf req_cnf criteria_cnf;
+      let nlits = output_wcnf oc ctx pkgs_cnf req_cnf criteria_cnf in
       close_out oc;
+      nlits
     in
     log "Resolving...";
     (* OpamFilename.copy ~src:solver_in ~dst:(OpamFilename.of_string "/tmp/input.wcnf"); *)
@@ -693,7 +698,7 @@ let call ~criteria ?(timeout = 60.) (preamble, universe, _ as cudf) =
      *     logsolver "err: %s" line
      *   ) cmd_res.r_stderr; *)
 
-    let solver_res = parse_solver_output pid stdout_lines in
+    let solver_res = parse_solver_output pid cnf_nlits stdout_lines in
     begin match solver_res with
       | Optimum_found pkgs ->
         logsolver "Optimum found";
