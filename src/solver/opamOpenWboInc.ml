@@ -121,6 +121,16 @@ module Syntax = struct
 
 end
 
+let list_flatten l =
+  List.fold_left (fun x y -> List.rev_append y x) [] l |> List.rev
+
+let list_map f l =
+  let rec loop acc = function
+    | [] -> List.rev acc
+    | x :: xs -> loop (f x :: acc) xs
+  in
+  loop [] l
+
 module Cnf : sig
   type lit = int
   type weight = Soft of int | Top
@@ -145,15 +155,22 @@ module Cnf : sig
     val fold: ('a -> lit -> 'a) -> 'a -> _ t -> 'a
   end
 
+  type 'a elt =
+    | Cl of 'a Clause.t
+    | Comment of string
+
   type 'a t
   val empty : 'a t
+  val and_comment : 'a t -> string -> 'a t
   val and_clause : 'a t -> 'a Clause.t -> 'a t
   val neg_clause : unweighted Clause.t -> unweighted t
   val neg_wclause : ctx -> weighted Clause.t -> weighted t
   val and_ : 'a t -> 'a t -> 'a t
   val andl : 'a t list -> 'a t
   val clauses : 'a Clause.t list -> 'a t
-  val fold : ('b -> 'a Clause.t -> 'b) -> 'b -> 'a t -> 'b
+  val fold : ('b -> 'a elt -> 'b) -> 'b -> 'a t -> 'b
+  val map_clauses : ('a Clause.t -> 'b Clause.t) -> 'a t -> 'b t
+  val flat_map_clauses : ('a Clause.t -> 'b t) -> 'a t -> 'b t
   val to_weighted : _ t -> weighted t
   val nclauses : 'a t -> int
 end = struct
@@ -193,13 +210,17 @@ end = struct
     let fold f acc (l, _) = List.fold_left f acc l
   end
 
-  type 'a t = 'a Clause.t list (* conjunction *)
+  type 'a elt =
+    | Cl of 'a Clause.t
+    | Comment of string
+  type 'a t = 'a elt list (* conjunction *)
 
   let empty = []
-  let and_clause cnf cl = cl :: cnf
+  let and_comment cnf s = Comment s :: cnf
+  let and_clause cnf cl = Cl cl :: cnf
   let neg_clause (cl, _) =
     (* ¬ (A \/ B \/ ...)  == ¬A /\ ¬B /\ ... *)
-    List.map (fun lit -> ([- lit], Top)) cl
+    list_map (fun lit -> Cl ([- lit], Top)) cl
   let neg_wclause ctx (cl, w) =
     (* ¬ (A \/ B \/ ...), w
 
@@ -223,14 +244,24 @@ end = struct
        where P is a fresh literal
     *)
     let p = fresh_lit ctx in
-    ([p], w) ::
-    (p :: cl, Top) ::
-    List.map (fun lit -> [-p; -lit], Top) cl
+    Cl ([p], w) ::
+    Cl (p :: cl, Top) ::
+    list_map (fun lit -> Cl ([-p; -lit], Top)) cl
   let and_ cnf1 cnf2 = List.rev_append cnf1 cnf2
-  let andl l = List.fold_left (fun x y -> and_ y x) [] l
-  let clauses l = l
+  let andl l = list_flatten l
+  let clauses l = list_map (fun cl -> Cl cl) l
   let fold f acc cnf = List.fold_left f acc cnf
-  let to_weighted cnf = cnf
+  let map_clauses f cnf = list_map (function
+      | Comment c -> Comment c
+      | Cl cl -> Cl (f cl)
+    ) cnf
+  let flat_map_clauses f cnf = list_map (function
+      | Comment c -> [Comment c]
+      | Cl cl -> f cl
+    ) cnf |> list_flatten
+  let to_weighted cnf =
+    list_map (function Cl c -> Cl c | Comment s -> Comment s)
+      cnf
   let nclauses = List.length
 end
 
@@ -300,7 +331,7 @@ let def_packages (_preamble, universe, _request) (pid: indexed_pkgs):
       List.iter (fun clause ->
           let expanded_clause =
             OpamStd.List.filter_map (expand_constraint pkg) clause
-            |> List.flatten
+            |> list_flatten
             |> Cnf.Clause.disj
           in
           push_clause (Cnf.Clause.lit_implies pid expanded_clause)
@@ -361,7 +392,7 @@ let def_request (_preamble, universe, request) (pid: indexed_pkgs):
       request.Cudf.upgrade
     >>| Cnf.clauses
   in
-  Cnf.andl @@ List.map (fun o -> o +! Cnf.empty) [inst; rem; up]
+  Cnf.andl @@ list_map (fun o -> o +! Cnf.empty) [inst; rem; up]
 
 let read_pkg_property_value preamble property p =
   match property with
@@ -402,6 +433,7 @@ let def_criterion (ctx: Cnf.ctx)  (preamble, universe, request) (pid: indexed_pk
         ) universe;
       let overall_max_version_lag =
         Hashtbl.fold (fun _ -> max) pkg_max_version_lag 0 in
+
       fun pkg v ->
         let pkg_max_ver_lag =
           Hashtbl.find pkg_max_version_lag pkg.Cudf.package in
@@ -415,30 +447,32 @@ let def_criterion (ctx: Cnf.ctx)  (preamble, universe, request) (pid: indexed_pk
     end else (fun _pkg v -> v)
   in
   let prop_val pkg =
-    read_pkg_property_value preamble property pkg
-    |> renormalize_property_value pkg
+    let pv = read_pkg_property_value preamble property pkg in
+    let pv' = renormalize_property_value pkg pv in
+    pv'
   in
+
+  let neg = function Plus -> Minus | Minus -> Plus in
 
   (* /!\ make sure that weights are >= 1. A prop value of 0 means that we drop
      the clause. *)
-  let cnf : Cnf.weighted Cnf.t =
-    let add_clause cnf (cl: Cnf.unweighted Cnf.Clause.t) (pv: int) =
+  let clauses : (Cnf.weighted Cnf.Clause.t * sign) list =
+    let add_clause clauses (cl: Cnf.unweighted Cnf.Clause.t) (pv: int) (polarity: sign) =
       if pv = 0 then
-        cnf
+        clauses
       else if pv > 0 then
-        Cnf.and_clause cnf (Cnf.Clause.with_weight cl (Cnf.Soft pv))
+        (Cnf.Clause.with_weight cl (Cnf.Soft pv), polarity) :: clauses
       else (* pv < 0 *)
-        Cnf.and_ (Cnf.neg_wclause ctx
-                    (Cnf.Clause.with_weight cl (Cnf.Soft (-pv))))
-          cnf
+        (* XXX does this really happen in practice? this code path is likely untested *)
+        (Cnf.Clause.with_weight cl (Cnf.Soft (-pv)), neg polarity) :: clauses
     in
     let module Cl = Cnf.Clause in
 
     match filter with
     | Installed ->
       Cudf.fold_packages (fun cnf pkg ->
-          add_clause cnf (Cl.singl @@ pid.get_id_exn pkg) (prop_val pkg)
-        ) Cnf.empty universe
+          add_clause cnf (Cl.singl @@ pid.get_id_exn pkg) (prop_val pkg) Plus
+        ) [] universe
 
     | Changed ->
       Cudf.fold_packages (fun cnf pkg ->
@@ -447,26 +481,26 @@ let def_criterion (ctx: Cnf.ctx)  (preamble, universe, request) (pid: indexed_pk
                Cl.singl @@ - pid.get_id_exn pkg
              else
                Cl.singl @@ pid.get_id_exn pkg)
-            (prop_val pkg)
-        ) Cnf.empty universe
+            (prop_val pkg) Plus
+        ) [] universe
 
     | Removed ->
       Cudf.fold_packages (fun cnf pkg ->
           if pkg.Cudf.installed then
             let pkg_any_version =
               Cudf.lookup_packages universe pkg.Cudf.package
-              |> List.map pid.get_id_exn
+              |> list_map pid.get_id_exn
               |> Cl.disj in
             (* add the negated(!) clause *)
-            add_clause cnf pkg_any_version (- (prop_val pkg))
+            add_clause cnf pkg_any_version (prop_val pkg) Minus
           else cnf
-        ) Cnf.empty universe
+        ) [] universe
 
     | New ->
       Cudf.fold_packages (fun cnf pkg ->
           if pkg.Cudf.installed then cnf else
-            add_clause cnf (Cl.singl @@ pid.get_id_exn pkg) (prop_val pkg)
-        ) Cnf.empty universe
+            add_clause cnf (Cl.singl @@ pid.get_id_exn pkg) (prop_val pkg) Plus
+        ) [] universe
 
     | Upgraded ->
       Cudf.fold_packages (fun cnf pkg ->
@@ -474,9 +508,9 @@ let def_criterion (ctx: Cnf.ctx)  (preamble, universe, request) (pid: indexed_pk
           else match Cudf.get_installed universe pkg.Cudf.package with
             | [] -> cnf
             | l when List.for_all (fun p -> p.Cudf.version < pkg.Cudf.version) l ->
-              add_clause cnf (Cl.singl @@ pid.get_id_exn pkg) (prop_val pkg)
+              add_clause cnf (Cl.singl @@ pid.get_id_exn pkg) (prop_val pkg) Plus
             | _ -> cnf
-        ) Cnf.empty universe
+        ) [] universe
 
     | Downgraded ->
       Cudf.fold_packages (fun cnf pkg ->
@@ -484,9 +518,9 @@ let def_criterion (ctx: Cnf.ctx)  (preamble, universe, request) (pid: indexed_pk
           else match Cudf.get_installed universe pkg.Cudf.package with
             | [] -> cnf
             | l when List.for_all (fun p -> p.Cudf.version > pkg.Cudf.version) l ->
-              add_clause cnf (Cl.singl @@ pid.get_id_exn pkg) (prop_val pkg)
+              add_clause cnf (Cl.singl @@ pid.get_id_exn pkg) (prop_val pkg) Plus
             | _ -> cnf
-        ) Cnf.empty universe
+        ) [] universe
 
     | Requested ->
       Cudf.fold_packages (fun cnf pkg ->
@@ -500,68 +534,88 @@ let def_criterion (ctx: Cnf.ctx)  (preamble, universe, request) (pid: indexed_pk
                 Cudf.version_matches pkg.Cudf.version cstr
               ) request.Cudf.upgrade
           then
-            add_clause cnf (Cl.singl @@ pid.get_id_exn pkg) (prop_val pkg)
+            add_clause cnf (Cl.singl @@ pid.get_id_exn pkg) (prop_val pkg) Plus
           else
             cnf
-        ) Cnf.empty universe
+        ) [] universe
   in
 
-  match sign with
-  | Plus ->
-    cnf
-  | Minus ->
-    (* Negate the clauses *)
-    Cnf.fold (fun acc clause -> Cnf.and_ (Cnf.neg_wclause ctx clause) acc)
-      Cnf.empty cnf
-
+  List.fold_left (fun cnf (cl, polarity) ->
+      let polarity =
+        match sign with
+        | Plus -> polarity
+        | Minus -> neg polarity
+      in
+      match polarity with
+      | Plus -> Cnf.and_clause cnf cl
+      | Minus -> Cnf.and_ (Cnf.neg_wclause ctx cl) cnf
+    ) Cnf.empty clauses
+    
 
 let def_criteria ctx cudf pid (criteria: criterion list): Cnf.weighted Cnf.t =
   (* Criteria are hierarchical, with the more important one coming first, etc. *)
-  let criteria_cnf = List.map (def_criterion ctx cudf pid) criteria in
+  let criteria_cnf = list_map (def_criterion ctx cudf pid) criteria in
 
   (* rescale weights to encode the hierarchy: the base weight of a level is the
      sum of the weights of the level below, plus one. *)
   List.fold_right (fun level_cnf (cnf, level_base_weight) ->
-      let cnf, level_weights_sum =
-        Cnf.fold (fun (cnf, level_weights_sum) cl ->
-            match Cnf.Clause.weight cl with
-            | Cnf.Top ->
-              (Cnf.and_clause cnf cl, level_weights_sum)
-            | Cnf.Soft w ->
-              let w' = level_base_weight + w in
-              (Cnf.and_clause cnf (Cnf.Clause.with_weight cl (Cnf.Soft w')),
-               level_weights_sum + w')
-          ) (cnf, 0) level_cnf
+      let level_weights_sum = ref 0 in
+      let level_cnf = Cnf.map_clauses (fun cl ->
+          match Cnf.Clause.weight cl with
+          | Cnf.Top -> cl
+          | Cnf.Soft w ->
+            let w' = level_base_weight + w in
+            level_weights_sum := !level_weights_sum + w';
+            Cnf.Clause.with_weight cl (Cnf.Soft w')
+        ) level_cnf
       in
-      (cnf, level_weights_sum + 1)
+      let cnf = Cnf.and_ level_cnf cnf in
+      (cnf, !level_weights_sum + 1)
     ) criteria_cnf (Cnf.empty, 0)
   |> fst
 
-let output_wcnf (cout: out_channel) (ctx: Cnf.ctx) (cnf: Cnf.weighted Cnf.t) =
-  let weights_sum = Cnf.fold (fun s clause ->
-      match Cnf.Clause.weight clause with
-      | Top -> s
-      | Soft w -> s + w
+let output_wcnf (cout: out_channel) (ctx: Cnf.ctx)
+    (pkgs_cnf: Cnf.unweighted Cnf.t)
+    (req_cnf: Cnf.unweighted Cnf.t)
+    (criteria_cnf: Cnf.weighted Cnf.t)
+  =
+  let cnf =
+    Cnf.andl [Cnf.to_weighted pkgs_cnf; Cnf.to_weighted req_cnf; criteria_cnf]
+  in
+  let weights_sum = Cnf.fold (fun s elt ->
+      match elt with
+      | Comment _ -> s
+      | Cl clause ->
+        match Cnf.Clause.weight clause with
+        | Top -> s
+        | Soft w -> s + w
     ) 0 cnf
   in
   let top = weights_sum + 1 in
   let max_lit = Cnf.max_lit ctx in
 
-  let output_clause cl =
-    let w =
-      match Cnf.Clause.weight cl with
-      | Top -> top
-      | Soft w -> w
-    in
-    Printf.fprintf cout "%d " w;
-    Cnf.Clause.fold (fun () lit -> Printf.fprintf cout "%d " lit) () cl;
-    Printf.fprintf cout "0\n"
+  let output_elt elt =
+    match elt with
+    | Cnf.Comment c ->
+      Printf.fprintf cout "c %s\n" c
+    | Cnf.Cl cl ->
+      let w =
+        match Cnf.Clause.weight cl with
+        | Top -> top
+        | Soft w -> w
+      in
+      Printf.fprintf cout "%d " w;
+      Cnf.Clause.fold (fun () lit -> Printf.fprintf cout "%d " lit) () cl;
+      Printf.fprintf cout "0\n"
   in
 
   Printf.fprintf cout "p wcnf %d %d %d\n" max_lit (Cnf.nclauses cnf) top;
-  (* Not required by the format, but output hard clauses first *)
-  Cnf.fold (fun () cl -> if Cnf.Clause.weight cl = Top then output_clause cl) () cnf;
-  Cnf.fold (fun () cl -> if Cnf.Clause.weight cl <> Top then output_clause cl) () cnf
+  Printf.fprintf cout "c Packages universe\n";
+  Cnf.fold (fun () -> output_elt) () (Cnf.to_weighted pkgs_cnf);
+  Printf.fprintf cout "c Request\n";
+  Cnf.fold (fun () -> output_elt) () (Cnf.to_weighted req_cnf);
+  Printf.fprintf cout "c Optimization criteria\n";
+  Cnf.fold (fun () -> output_elt) () criteria_cnf;
 
 type solver_result =
   | Optimum_found of Cudf.package list
@@ -588,15 +642,18 @@ let parse_solver_output (pid: indexed_pkgs) (output: string list): solver_result
       with Not_found ->
         raise (Common.CudfSolver.Error "Ill-formed output: no solution values")
     in
+    log "solution nvalues: %d" (List.length values);
     OpamStd.List.filter_map (fun s ->
         try
           let x = int_of_string s in
-          if x > 0 then (
-            let pkg = pid.get_pkg x in
-            Some { pkg with Cudf.was_installed = pkg.Cudf.installed;
-                            Cudf.installed = true }
-          ) else None
-        with Not_found | Invalid_argument _ ->
+          if x < 0 then None
+          else match pid.get_pkg x with
+            | pkg ->
+              Some { pkg with Cudf.was_installed = pkg.Cudf.installed;
+                              Cudf.installed = true }
+            | exception Not_found ->
+              None
+        with Invalid_argument _ ->
           raise (Common.CudfSolver.Error
                    ("Ill-formed output: invalid solution literal " ^ s))
       ) values
@@ -619,41 +676,54 @@ let call ~criteria ?(timeout = 60.) (preamble, universe, _ as cudf) =
   log "Generating optimization criteria";
   let criteria = Syntax.criteria_of_string criteria in
   let criteria_cnf =def_criteria ctx cudf pid criteria in
-  let cnf =
-    Cnf.andl [
-      Cnf.to_weighted pkgs_cnf;
-      Cnf.to_weighted req_cnf;
-      criteria_cnf
-    ]
-  in
   log "Resolving...";
   let solver_in =
     OpamFilename.of_string (OpamSystem.temp_file "solver-open-wbo-inc-in") in
+  let solver_out =
+    OpamFilename.of_string (OpamSystem.temp_file "solver-open-wbo-inc-out") in
   try
     let () =
       let oc = OpamFilename.open_out solver_in in
-      output_wcnf oc ctx cnf;
+      output_wcnf oc ctx pkgs_cnf req_cnf criteria_cnf;
       close_out oc
     in
+    (* OpamFilename.copy ~src:solver_in ~dst:(OpamFilename.of_string "/tmp/input.wcnf"); *)
     let cmd =
       OpamProcess.command
         ~name:"open-wbo-inc"
         ~allow_stdin:false
         ~verbose:(OpamCoreConfig.(abs !r.debug_level >= 2))
+        ~stdout:(OpamFilename.to_string solver_out)
         "timeout"
         ["-s"; "15"; (* SIGTERM *)
          string_of_int (int_of_float timeout);
          command_name_s;
          "-ca=1";
-         (* number of clusters; not sure whether the +1 is necessary *)
+         (* -c: number of clusters; not sure whether the +1 is necessary *)
          "-c=" ^ string_of_int (List.length criteria + 1);
+         "-no-complete";
          "-algorithm=6";
          OpamFilename.to_string solver_in]
     in
+    log "before";
     let cmd_res = OpamProcess.run cmd in
+    log "after";
+    let stdout_lines =
+      OpamFilename.read solver_out |> String.split_on_char '\n'
+    in
     OpamFilename.remove solver_in;
+    OpamFilename.remove solver_out;
     OpamProcess.cleanup cmd_res;
-    let solver_res = parse_solver_output pid cmd_res.r_stdout in
+
+    (* List.iter (fun line ->
+     *     logsolver "out: %s" line
+     *   ) cmd_res.r_stdout; *)
+
+    (* List.iter (fun line ->
+     *     logsolver "err: %s" line
+     *   ) cmd_res.r_stderr; *)
+
+    let solver_res = parse_solver_output pid stdout_lines in
     begin match solver_res with
       | Optimum_found pkgs ->
         logsolver "Optimum found";
@@ -670,4 +740,5 @@ let call ~criteria ?(timeout = 60.) (preamble, universe, _ as cudf) =
     fun u -> Some preamble, u
   with e ->
     OpamStd.Exn.finalise e @@ fun () ->
-    OpamFilename.remove solver_in
+    OpamFilename.remove solver_in;
+    OpamFilename.remove solver_out
