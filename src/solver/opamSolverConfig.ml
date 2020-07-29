@@ -178,8 +178,66 @@ let criteria kind =
     | lazy None -> str
   else str
 
-let call_solver ~criteria cudf =
+let solution_score criteria preamble request universe_before universe =
+  let criteria = OpamSolverCriteria.of_string criteria in
+  let was_installed p =
+    (Cudf.lookup_package universe_before (p.Cudf.package, p.Cudf.version)).
+      Cudf.installed
+  in
+  let filtered_pkgs f =
+    let filter =
+      match f with
+      | OpamSolverCriteria.Installed -> fun p -> p.Cudf.installed
+      | Changed -> fun p -> p.Cudf.installed <> was_installed p
+      | Removed -> fun p -> was_installed p && not p.Cudf.installed
+      | New -> fun p -> not (was_installed p) && p.Cudf.installed
+      | Upgraded -> fun p ->
+        p.Cudf.installed &&
+        List.exists was_installed @@
+        Cudf.lookup_packages ~filter:(Some (`Lt, p.Cudf.version)) universe
+          p.Cudf.package
+      | Downgraded -> fun p ->
+        p.Cudf.installed &&
+        List.exists was_installed @@
+        Cudf.lookup_packages ~filter:(Some (`Gt, p.Cudf.version)) universe
+          p.Cudf.package
+      | Requested -> fun p ->
+        List.exists (fun (name, cstr) ->
+            p.Cudf.package = name && Cudf.version_matches p.Cudf.version cstr)
+          request.Cudf.install ||
+        List.exists (fun (name, cstr) ->
+            p.Cudf.package = name && Cudf.version_matches p.Cudf.version cstr)
+          request.Cudf.upgrade
+    in
+    Cudf.get_packages ~filter universe
+  in
+  List.map (fun (sign, filter, property) ->
+      let pkgs = filtered_pkgs filter in
+      let score =
+        List.fold_left (fun score pkg ->
+            score +
+            OpamSolverCriteria.read_pkg_property_value preamble property pkg
+          ) 0 pkgs
+      in
+      match sign with
+      | OpamSolverCriteria.Plus ->
+        score
+      | Minus ->
+        - score
+    ) criteria
+
+let call_solver ~criteria (preamble, universe_before, request as cudf) =
   let module S = (val Lazy.force (!r.solver)) in
   OpamConsole.log "SOLVER" "Calling solver %s with criteria %s"
     (OpamCudfSolver.get_name (module S)) criteria;
-  S.call ~criteria ?timeout:(!r.solver_timeout) cudf
+  let (preamble', u) = S.call ~criteria ?timeout:(!r.solver_timeout) cudf in
+  begin match OpamStd.Env.getopt "OPAMCUDFSCORE" with
+    | None -> ()
+    | Some score_file ->
+      let score = solution_score criteria preamble request universe_before u in
+      let cout = open_out score_file in
+      List.iter (Printf.fprintf cout "%d ") score;
+      Printf.fprintf cout "\n";
+      close_out cout
+  end;
+  (preamble', u)
